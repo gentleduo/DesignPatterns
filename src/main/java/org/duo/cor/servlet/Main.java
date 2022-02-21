@@ -6,6 +6,8 @@ import java.util.List;
 /**
  * Chain of Responsibility
  * 责任链模式将一些处理请求的对象都串在一根绳子上，这个处理完，下一个处理完，直到所有的对象都处理完
+ * <p>
+ * 完全模拟servlet中的filter
  */
 public class Main {
 
