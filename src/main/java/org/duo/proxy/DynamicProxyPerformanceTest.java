@@ -4,15 +4,11 @@ import javassist.*;
 import javassist.util.proxy.MethodHandler;
 import javassist.util.proxy.ProxyFactory;
 import javassist.util.proxy.ProxyObject;
-import jdk.internal.org.objectweb.asm.ClassWriter;
-import jdk.internal.org.objectweb.asm.FieldVisitor;
-import jdk.internal.org.objectweb.asm.MethodVisitor;
-import jdk.internal.org.objectweb.asm.Opcodes;
+import jdk.internal.org.objectweb.asm.*;
 import net.sf.cglib.proxy.Enhancer;
 import net.sf.cglib.proxy.MethodInterceptor;
 import net.sf.cglib.proxy.MethodProxy;
 
-import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -21,13 +17,31 @@ import java.text.DecimalFormat;
 /**
  * https://www.cnblogs.com/strongmore/p/13449590.html
  * http://javahao123.com/?p=631
+ * https://gist.github.com/mschonaker/662032
+ * https://www.iteye.com/blog/javatar-814426
  */
 public class DynamicProxyPerformanceTest {
 
+    /**
+     * 动态代理方案性能对比
+     * 测试结论：
+     * 1.ASM和JAVAASSIST字节码生成方式不相上下，都很快，是CGLIB和JDK自带的1.5倍左右。
+     * 2.JDK1.6对动态代理做了优化，如果用低版本JDK更慢，要注意的是JDK也是通过字节码生成来实现动态代理的，而不是反射。
+     * 3.JAVAASSIST提供者动态代理接口最慢(原因是它使用的是反射的机制)
+     * 差异原因：
+     * 各方案生成的字节码不一样，像JDK和CGLIB都考虑了很多因素，以及继承或包装了自己的一些类， 所以生成的字节码非常大，而我们很多时候用不上这些，
+     * 而手工生成的字节码非常小，所以速度快，
+     * 最终选型：
+     * 建议使用使用JAVAASSIST的字节码生成代理方式，虽然ASM稍快，但并没有快一个数量级，
+     * 而JAVAASSIST的字节码生成方式比ASM方便，JAVAASSIST只需用字符串拼接出Java源码，便可生成相应字节码，
+     * 而ASM需要手工写字节码。
+     *
+     * @param args
+     * @throws Exception
+     */
     public static void main(String[] args) throws Exception {
 
 //        System.getProperties().put("sun.misc.ProxyGenerator.saveGeneratedFiles", "true");
-
         CountService delegate = new CountServiceImpl();
         long time = System.currentTimeMillis();
         CountService jdkProxy = createJdkDynamicProxy(delegate);
@@ -50,7 +64,7 @@ public class DynamicProxyPerformanceTest {
         System.out.println("Create JAVAASSIST Bytecode Proxy: " + time + " ms");
 
         time = System.currentTimeMillis();
-        CountService asmBytecodeProxy = createAsmBytecodeDynamicProxy(delegate);
+        CountService asmBytecodeProxy = createAsmBytecodeDynamicProxy();
         time = System.currentTimeMillis() - time;
         System.out.println("Create ASM Proxy: " + time + " ms");
         System.out.println("================");
@@ -60,11 +74,9 @@ public class DynamicProxyPerformanceTest {
             test(cglibProxy, "Run CGLIB Proxy: ");
             test(javassistProxy, "Run JAVAASSIST Proxy: ");
             test(javassistBytecodeProxy, "Run JAVAASSIST Bytecode Proxy: ");
-//            test(asmBytecodeProxy, "Run ASM Bytecode Proxy: ");
+            test(asmBytecodeProxy, "Run ASM Bytecode Proxy: ");
             System.out.println("----------------");
         }
-
-
     }
 
     private static void test(CountService service, String label)
@@ -149,67 +161,92 @@ public class DynamicProxyPerformanceTest {
         CtClass mCtc = mPool.makeClass(CountService.class.getName() + "JavaassistProxy");
         mCtc.addInterface(mPool.get(CountService.class.getName()));
         mCtc.addConstructor(CtNewConstructor.defaultConstructor(mCtc));
-//        mCtc.addField(CtField.make("public " + CountService.class.getName() + " delegate;", mCtc));
         mCtc.addField(CtField.make("private int count = 0 ;", mCtc));
         mCtc.addMethod(CtNewMethod.make("public int count() { return count++ ; }", mCtc));
         Class<?> pc = mCtc.toClass();
         CountService bytecodeProxy = (CountService) pc.newInstance();
-//        Field filed = bytecodeProxy.getClass().getField("delegate");
-//        Field filed = bytecodeProxy.getClass().getField("count");
-//        filed.set(bytecodeProxy, delegate);
         return bytecodeProxy;
     }
 
-    private static CountService createAsmBytecodeDynamicProxy(CountService delegate) throws Exception {
-        ClassWriter classWriter = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
-        String className = CountService.class.getName() + "AsmProxy";
+    private static CountService createAsmBytecodeDynamicProxy() throws Exception {
+
+        ClassWriter cw = new ClassWriter(0);
+        FieldVisitor fv;
+        MethodVisitor mv;
+        String className = "org.duo.proxy.CountServiceAsmProxy";
         String classPath = className.replace('.', '/');
-        String interfacePath = CountService.class.getName().replace('.', '/');
+
         // 通过visit方法确定类的头部信息
         // Opcodes.V1_8:java版本
         // Opcodes.ACC_PUBLIC:类修饰符
         // classPath:类的全限定名
         // java/lang/Object:继承类
         // interfacePath:实现的接口
-        classWriter.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC, classPath, null, "java/lang/Object", new String[]{interfacePath});
+        // 这里如果是实现接口的话必须定义成内部类，否则会报java.lang.IllegalAccessError异常(CountService和CountServiceAsmProxy不是同一个ClassLoader)
+        // java.lang.IllegalAccessError: class org.duo.proxy.CountServiceAsmProxy cannot access its superinterface org.duo.proxy.CountService
+        cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC, classPath, null, "java/lang/Object", new String[]{"org/duo/proxy/DynamicProxyPerformanceTest$CountService"});
 
-        //创建构造函数
-        MethodVisitor initVisitor = classWriter.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null);
-        initVisitor.visitCode();
-        initVisitor.visitVarInsn(Opcodes.ALOAD, 0);
-        initVisitor.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", true);
-        initVisitor.visitInsn(Opcodes.RETURN);
-        initVisitor.visitMaxs(0, 0);
-        initVisitor.visitEnd();
+        cw.visitInnerClass("org/duo/proxy/DynamicProxyPerformanceTest$CountService",
+                "org/duo/proxy/DynamicProxyPerformanceTest", "CountService", Opcodes.ACC_PUBLIC + Opcodes.ACC_STATIC
+                        + Opcodes.ACC_ABSTRACT + Opcodes.ACC_INTERFACE);
 
-        // 定义变量:delegate
-        FieldVisitor fieldVisitor = classWriter.visitField(Opcodes.ACC_PUBLIC, "delegate", "L" + interfacePath + ";", null, null);
-        fieldVisitor.visitEnd();
+//        cw.visitSource("DynamicProxyPerformanceTest.java", null);
 
+        // 定义成员变量:count
+        {
+            fv = cw.visitField(Opcodes.ACC_PRIVATE, "count", "I", null, null);
+            fv.visitEnd();
+        }
+        // 创建构造函数
+        {
+            mv = cw.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null);
+            mv.visitCode();
+            Label l0 = new Label();
+            mv.visitLabel(l0);
+            mv.visitLineNumber(250, l0);
+            mv.visitVarInsn(Opcodes.ALOAD, 0);
+            mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
+            Label l1 = new Label();
+            mv.visitLabel(l1);
+            mv.visitLineNumber(252, l1);
+            mv.visitVarInsn(Opcodes.ALOAD, 0);
+            mv.visitInsn(Opcodes.ICONST_0);
+            mv.visitFieldInsn(Opcodes.PUTFIELD, "org/duo/proxy/CountServiceAsmProxy", "count", "I");
+            mv.visitInsn(Opcodes.RETURN);
+            Label l2 = new Label();
+            mv.visitLabel(l2);
+            mv.visitLocalVariable("this", "Lorg/duo/proxy/CountServiceAsmProxy;", null, l0, l2, 0);
+            mv.visitMaxs(2, 1);
+            mv.visitEnd();
+        }
         // 定义方法:count
-        MethodVisitor methodVisitor = classWriter.visitMethod(Opcodes.ACC_PUBLIC, "count", "()I", null, null);
-        methodVisitor.visitCode();
-        methodVisitor.visitVarInsn(Opcodes.ALOAD, 0);
-        methodVisitor.visitFieldInsn(Opcodes.GETFIELD, classPath, "delegate", "L" + interfacePath + ";");
-        methodVisitor.visitMethodInsn(Opcodes.INVOKEINTERFACE, interfacePath, "count", "()I", true);
-        methodVisitor.visitInsn(Opcodes.IRETURN);
-        methodVisitor.visitMaxs(0, 0);
-        methodVisitor.visitEnd();
+        {
+            mv = cw.visitMethod(Opcodes.ACC_PUBLIC, "count", "()I", null, null);
+            mv.visitCode();
+            Label l0 = new Label();
+            mv.visitLabel(l0);
+            mv.visitLineNumber(256, l0);
+            mv.visitVarInsn(Opcodes.ALOAD, 0);
+            mv.visitInsn(Opcodes.DUP);
+            mv.visitFieldInsn(Opcodes.GETFIELD, "org/duo/proxy/CountServiceAsmProxy", "count", "I");
+            mv.visitInsn(Opcodes.DUP_X1);
+            mv.visitInsn(Opcodes.ICONST_1);
+            mv.visitInsn(Opcodes.IADD);
+            mv.visitFieldInsn(Opcodes.PUTFIELD, "org/duo/proxy/CountServiceAsmProxy", "count", "I");
+            mv.visitInsn(Opcodes.IRETURN);
+            Label l1 = new Label();
+            mv.visitLabel(l1);
+            mv.visitLocalVariable("this", "Lorg/duo/proxy/CountServiceAsmProxy;", null, l0, l1, 0);
+            mv.visitMaxs(4, 1);
+            mv.visitEnd();
+        }
+        cw.visitEnd();
 
-        classWriter.visitEnd();
-        byte[] code = classWriter.toByteArray();
-
-        String name = CountService.class.getName();
-
+        byte[] code = cw.toByteArray();
         ByteArrayClassLoader classLoader = new ByteArrayClassLoader();
-        Class<?> bytecodeProxy = classLoader.getClass(className, code);
-        System.out.println(bytecodeProxy);
-//        Class<?> bytecodeProxy = new ByteArrayClassLoader().getClass(className, code);
-
-//        CountService bytecodeProxy = (CountService) new ByteArrayClassLoader().getClass(className, code).newInstance();
-//        Field filed = bytecodeProxy.getClass().getField("delegate");
-//        filed.set(bytecodeProxy, delegate);
-        return null;
+        Class<?> clazz = classLoader.getClass(className, code);
+        CountService bytecodeProxy = (CountService) clazz.newInstance();
+        return bytecodeProxy;
     }
 
     private static class ByteArrayClassLoader extends ClassLoader {
@@ -218,7 +255,6 @@ public class DynamicProxyPerformanceTest {
 //            super(ByteArrayClassLoader.class.getClassLoader());
             super(Thread.currentThread().getContextClassLoader());
         }
-
 
         /**
          * 将字节数组转化为Class对象
@@ -232,27 +268,22 @@ public class DynamicProxyPerformanceTest {
                 throw new IllegalArgumentException("");
             }
 
-            return defineClass(name, code, 0, code.length);
-//            try {
-//                return super.findClass(name);
-//            } catch (ClassNotFoundException ignored) {
-//                return defineClass(name, code, 0, code.length);
-//            }
+            return super.defineClass(name, code, 0, code.length);
         }
     }
-}
 
-interface CountService {
+    public static interface CountService {
 
-    int count();
-}
+        int count();
+    }
 
-class CountServiceImpl implements CountService {
+    static class CountServiceImpl implements CountService {
 
-    private int count = 0;
+        private int count = 0;
 
-    @Override
-    public int count() {
-        return count++;
+        @Override
+        public int count() {
+            return count++;
+        }
     }
 }
