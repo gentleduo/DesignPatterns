@@ -28,6 +28,7 @@ public class Main {
 
     }
 }
+
 class Msg {
     String name;
     String msg;
@@ -69,7 +70,7 @@ class SensitiveFilter implements Filter {
         String r = m.getMsg();
         r = r.replaceAll("996", "955");
         m.setMsg(r);
-        return false;
+        return true;
     }
 }
 
@@ -102,8 +103,8 @@ class FilterChain implements Filter {
     }
 
     public boolean doFilter(Msg m) {
-        for(Filter f : filters) {
-            if(!f.doFilter(m)) return false;
+        for (Filter f : filters) {
+            if (!f.doFilter(m)) return false;
         }
 
         return true;
